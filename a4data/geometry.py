@@ -11,7 +11,6 @@ Geometry functions return channel-last maps; the provided pipeline converts
 them to channel-first maps for the dataloader.
 """
 
-# TODO intermediate variables are intentionally unused until implemented.
 # ruff: noqa: F841, RUF059
 
 import torch
@@ -34,9 +33,20 @@ def resize_intrinsics(
             align_corners=False resize: for each image axis,
             x_out + 0.5 = (size_out / size_in) * (x_in + 0.5).
     """
-    # TODO (Q1.1): Update focal lengths and principal point for the resize.
-    K_resized = None  # (3, 3)
-    raise NotImplementedError("Q1.1: resize_intrinsics")
+    K_resized = torch.clone(K)
+
+    h_out, w_out = output_hw
+    h_in, w_in = input_hw
+
+    s_x = w_out / w_in
+    s_y = h_out / h_in
+
+    K_resized[0, 0] *= s_x
+    K_resized[1, 1] *= s_y
+
+    K_resized[0, 2] = s_x * (K[0, 2] + 0.5) - 0.5
+    K_resized[1, 2] = s_y * (K[1, 2] + 0.5) - 0.5
+
     return K_resized
 
 
@@ -58,15 +68,27 @@ def unproject_depth(
     """
     H, W = depth.shape[-2:]
 
-    # TODO (Q1.2): Build homogeneous pixel coordinates.
-    pixels = None  # (H, W, 3)
+    v, u = torch.meshgrid(
+        torch.arange(H, dtype=depth.dtype, device=depth.device),
+        torch.arange(W, dtype=depth.dtype, device=depth.device),
+        indexing='ij'
+    )
+    
+    pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1)
 
-    # TODO (Q1.2): Unproject pixels to camera-space points using K and z-depth.
-    points_camera = None  # (V, H, W, 3)
+    K_inv = torch.linalg.inv(K)
+    rays = torch.einsum("vij,hwj->vhwi", K_inv, pixels)
 
-    # TODO (Q1.2): Transform camera-space points into world coordinates.
-    points_world = None  # (V, H, W, 3)
-    raise NotImplementedError("Q1.2: unproject_depth")
+    points_camera = rays * depth[:, 0, :, :, None]
+
+    R = T_world_from_camera[:, :3, :3]
+    T = T_world_from_camera[:, :3, 3]
+
+    points_world = (
+            torch.einsum("vij,vhwj->vhwi", R, points_camera)
+            + T[:, None, None, :]
+    )
+
     return points_world
 
 
@@ -96,14 +118,19 @@ def canonicalize_cameras(
     Camera 0 is the first sampled view. Transform cameras to its coordinate
     frame, then unproject depth using your Q1.2 function. Call the provided
     compute_scene_scale to obtain the valid-point centroid's distance from
-    the origin. Divide translations, depth and points by this scale;
+    the origin. Divide translations, depth and points by this sscale;
     do not subtract the centroid.
     """
-    # TODO (Q1.3): Choose camera 0 as the reference and transform all poses.
-    original_world_from_reference = None  # (4, 4)
-    # Compute relative transforms in float64 for precision, then cast to float32.
-    poses_relative = None  # (V, 4, 4)
-    raise NotImplementedError("Q1.3: canonicalize_cameras")
+    original_world_from_reference = T_world_from_camera[0]  # (4, 4)
+
+    # Compute relative transforms in float64 for precision
+    T64 = T_world_from_camera.to(torch.float64)
+
+    reference_from_world = torch.linalg.inv(T64[0])
+
+    poses_relative = (
+            reference_from_world @ T64
+    ).to(torch.float32)  # (V, 4, 4)
 
     # Use your Q1.2 implementation to compute points in the first camera's frame.
     points_reference = unproject_depth(K, poses_relative, depth)  # (V, H, W, 3)
@@ -113,9 +140,16 @@ def canonicalize_cameras(
 
     # TODO (Q1.3): Divide translations, depth and points by the same scale.
     # Keep camera 0 at the origin; do not subtract the point-cloud centroid.
-    poses_normalized = None  # (V, 4, 4)
-    depth_normalized = None  # (V, 1, H, W)
-    points_normalized = None  # (V, H, W, 3), invalid pixels zero
+    poses_normalized = poses_relative.clone()
+    poses_normalized[:, :3, 3] /= scene_scale  # (V, 4, 4)
+
+    depth_normalized = depth / scene_scale  # (V, 1, H, W)
+    points_normalized = points_reference / scene_scale  # (V, H, W, 3), invalid pixels zero
+
+    points_normalized = points_normalized.masked_fill(
+        ~depth_valid.reshape(depth.shape[0], depth.shape[2], depth.shape[3], 1),
+        0.0,
+    )
 
     return (
         poses_normalized,
@@ -146,18 +180,31 @@ def camera_rays(
     """
     H, W = image_hw
 
-    # TODO (Q1.4): Build homogeneous pixel coordinates for the image grid.
-    pixels = None  # (H, W, 3)
+    v, u = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32, device=K.device),
+        torch.arange(W, dtype=torch.float32, device=K.device),
+        indexing="ij",
+    )
+    pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1) # (H, W, 3)
 
-    # TODO (Q1.4): Convert pixels to camera-space ray directions using K.
-    camera_directions = None  # (V, H, W, 3)
+    K_inv = torch.linalg.inv(K)
+    camera_directions = torch.einsum(
+        "vij,hwj->vhwi", K_inv, pixels
+    )
+    # (V, H, W, 3)
 
-    # TODO (Q1.4): Rotate directions to world space and normalize each vector.
-    directions = None  # (V, H, W, 3)
+    R = T_world_from_camera[:, :3, :3]  # (V, 3, 3)
+    directions = torch.einsum(
+        "vij,vhwj->vhwi", R, camera_directions
+    )
 
-    # TODO (Q1.4): Broadcast each camera center as the ray origins.
-    origins = None  # (V, H, W, 3)
-    raise NotImplementedError("Q1.4: camera_rays")
+    directions = torch.nn.functional.normalize(directions, dim=-1)
+
+    camera_origins = T_world_from_camera[:, :3, 3]
+    camera_origins = camera_origins[:, None, None, :]
+
+    origins = camera_origins.expand(-1, H, W, -1)  # (V, H, W, 3)
+
     return origins, directions
 
 
@@ -174,10 +221,7 @@ def plucker_coordinates(
         plucker: (V, H, W, 6), direction followed by moment: [d, m].
             Use the convention m = o x d.
     """
-    # TODO (Q1.5): Compute the ray moments.
-    moments = None  # (V, H, W, 3)
+    moments = torch.cross(origins, directions, dim=-1)  # (V, H, W, 3)
+    plucker = torch.cat([directions, moments], dim=-1)  # (V, H, W, 6)
 
-    # TODO (Q1.5): Concatenate directions and moments along the last dimension.
-    plucker = None  # (V, H, W, 6)
-    raise NotImplementedError("Q1.5: plucker_coordinates")
     return plucker
