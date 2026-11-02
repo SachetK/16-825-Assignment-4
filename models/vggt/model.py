@@ -107,7 +107,7 @@ class MiniVGGT(nn.Module):
             if i % 2 == 0:
                 # Frame attention: (B, V, N, D) -> (B*V, N, D)
                 output = tokens.reshape(b * v, n, d)
-                output = block(output, self.positions)
+                output = block(output, self.positions.unsqueeze(0))
 
                 # Restore shape and save frame output
                 tokens = output.reshape(b, v, n, d)
