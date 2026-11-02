@@ -8,6 +8,7 @@ Fill the None placeholders and remove the corresponding NotImplementedError.
 # ruff: noqa: F841
 
 import torch
+import torch.nn.functional as F
 
 from models.vggt.camera import pose_encoding
 from models.vggt.loss_utils import trimmed_mean  # noqa: F401 -- used in TODOs
@@ -34,12 +35,13 @@ def camera_loss(predictions, targets):
     pred_t, gt_t = predicted[..., :3], expected[..., :3]
     pred_q, gt_q = predicted[..., 3:7], expected[..., 3:7]
     pred_fov, gt_fov = predicted[..., 7:], expected[..., 7:]
-    # TODO (Q3.0): Mean translation L1, clamping each error at 100 before averaging.
-    translation = None
-    # TODO (Q3.0): Mean quaternion L1 and mean FoV L1.
-    rotation = None
-    fov = None
-    raise NotImplementedError("Q3.0: camera_loss")
+    # Mean translation L1, clamping each error at 100 before averaging.
+    translation = F.l1_loss(torch.clamp_max(pred_t, 100), gt_t)
+
+    # Mean quaternion L1 and mean FoV L1.
+    rotation = F.l1_loss(pred_q, gt_q)
+    fov = F.l1_loss(pred_fov, gt_fov)
+
     return translation + rotation + 0.5 * fov
 
 
@@ -63,11 +65,14 @@ def depth_gradient_loss(prediction, target, valid):
         valid_x = mask[..., 1:] & mask[..., :-1]
         valid_y = mask[..., 1:, :] & mask[..., :-1, :]
         # TODO (Q3.0): Absolute adjacent residual differences, clamped at 100.
-        dx = None  # Same shape as valid_x.
-        dy = None  # Same shape as valid_y.
+        dx = F.l1_loss(diff[..., 1:], diff[..., :-1], reduction="none").clamp(max=100)
+        dy = F.l1_loss(diff[..., 1:, :], diff[..., :-1, :], reduction="none").clamp(max=100)
+
         # TODO (Q3.0): Sum valid x/y differences, divide by mask.sum().clamp_min(1).
-        scale_loss = None  # Scalar ().
-        raise NotImplementedError("Q3.0: depth_gradient_loss")
+        scale_loss = (
+            (dx * valid_x).sum() + (dy * valid_y).sum()
+        ) / mask.sum().clamp_min(1)  # Scalar ().
+
         total = total + scale_loss
     return total / 4
 
@@ -93,12 +98,13 @@ def depth_loss(predictions, targets):
     pred_depth = predictions["depth"][valid]
     gt_depth = targets["depth"][valid]
     confidence = predictions["depth_conf"][valid]
-    # TODO (Q3.0): Per-pixel absolute depth error.
-    error = None  # (num_valid_pixels,).
-    # TODO (Q3.0): Use trimmed_mean for regression and confidence-weighted loss.
-    regression = None
-    confidence_loss = None
-    raise NotImplementedError("Q3.0: depth_loss")
+
+    error = F.l1_loss(pred_depth, gt_depth, reduction="none")
+    regression = trimmed_mean(error)
+    confidence_loss = trimmed_mean(
+        confidence * error - 0.2 * torch.log(confidence)
+    )
+
     gradient = depth_gradient_loss(predictions["depth"], targets["depth"], valid)
     return regression + confidence_loss + gradient
 

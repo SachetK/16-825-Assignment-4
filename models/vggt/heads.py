@@ -63,9 +63,12 @@ class CameraHead(nn.Module):
         apply ReLU only to the FoV channels. Compute the activation in float32.
         Do not normalize or flip the quaternion before the camera loss.
         """
-        # TODO (Q3.0): Apply self.mlp and the FoV activation above.
-        raise NotImplementedError("Q3.0: CameraHead.predict")
+        camera_params = self.mlp(camera_features)
 
+        pose = camera_params[..., :-2]
+        fov = torch.relu(camera_params[..., -2:].float())
+
+        return torch.cat([pose, fov], dim=-1)
 
 class DepthHead(nn.Module):
     def __init__(self, width, patch_size):
@@ -96,14 +99,37 @@ class DepthHead(nn.Module):
             depth_conf: (B,V,1,H,W), 1 + exp(raw_confidence).
         """
         b, v, _, h, w = rgb.shape
-        # TODO (Q3.0): Apply self.dense and the provided patches_to_image.
-        dense = None  # (B,V,self.channels,H,W).
-        # TODO (Q3.0): Add self.refine([dense, rgb]) as a dense residual.
+        # Apply self.dense and the provided patches_to_image.
+        dense = patches_to_image(
+            self.dense(patches) ,
+            h, w, self.patch_size
+        ) # (B,V,self.channels,H,W).
+
+        # Add self.refine([dense, rgb]) as a dense residual.
         # Flatten B,V before Conv2d, then restore them.
-        refined = None  # (B,V,self.channels,H,W).
-        # TODO (Q3.0): Project confidence, reconstruct its map, and activate
+        refine_input = torch.cat([
+            dense.reshape(b * v, self.channels, h, w),
+            rgb.reshape(b * v, 3, h, w)
+        ], dim=1)
+
+        # Predict residual and add it to dense
+        residual = self.refine(refine_input).reshape(
+            b, v, self.channels, h, w
+        )
+        refined = dense + residual
+
+        # Project confidence, reconstruct its map, and activate
         # depth/confidence.
-        raise NotImplementedError("Q3.0: DepthHead.forward")
+        confidence = patches_to_image(
+            self.confidence(patches), h, w, self.patch_size
+        )
+
+        return {
+            "depth": torch.exp(refined),
+            "depth_conf": 1.0 + torch.exp(confidence)
+        }
+
+
 
 
 class PointHead(nn.Module):

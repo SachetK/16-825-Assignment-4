@@ -19,9 +19,7 @@ def view_synthesis_loss(pred_rgb, target_rgb):
         Scalar tensor averaged over all views and pixels. All pixels count:
         depth validity does not mask RGB.
     """
-    # TODO (Q2.0): Mean squared error over every element of both tensors.
-    loss = None  # Scalar ().
-    raise NotImplementedError("Q2.0: view_synthesis_loss")
+    loss = F.mse_loss(pred_rgb, target_rgb)  # Scalar ().
     return loss
 
 

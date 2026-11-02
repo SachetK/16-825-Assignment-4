@@ -106,15 +106,20 @@ def patchify(images, patch_size):
     if h % p or w % p:
         raise ValueError(f"Image size {(h, w)} not divisible by patch size {p}")
     gh, gw = h // p, w // p
-    # TODO (Q2.0): Flatten all leading dims into one and split H and W into
+
+    # Flatten all leading dims into one and split H and W into
     # (gh, p) and (gw, p) blocks, giving (L, C, gh, p, gw, p).
-    x = None
-    # TODO (Q2.0): Reorder to (L, gh, gw, p, p, C): row-major patches, each
+    x = images.reshape(-1, c, gh, p, gw, p)
+
+    # Reorder to (L, gh, gw, p, p, C): row-major patches, each
     # flattened in (row, col, channel) order.
-    x = None
-    # TODO (Q2.0): Merge the grid and each patch's contents, restoring the
+    x = x.permute(0, 2, 4, 3, 5, 1)
+
+    # Merge the grid and each patch's contents, restoring the
     # leading dims: (*lead, gh*gw, p*p*C).
-    raise NotImplementedError("Q2.0: patchify")
+    x = x.reshape(*lead, gh*gw, p*p*c)
+
+    return x
 
 
 def unpatchify(patches, patch_size, image_hw):
@@ -135,14 +140,17 @@ def unpatchify(patches, patch_size, image_hw):
     if n != gh * gw or dim % (p * p) != 0:
         raise ValueError("Patch tensor does not match patch_size / image_hw")
     c = dim // (p * p)
-    # TODO (Q2.0): Flatten leading dims and unflatten each patch to
-    # (L, gh, gw, p, p, C).
-    x = None
-    # TODO (Q2.0): Reorder to (L, C, gh, p, gw, p).
-    x = None
-    # TODO (Q2.0): Merge to (*lead, C, H, W).
-    raise NotImplementedError("Q2.0: unpatchify")
 
+    # Flatten leading dims and unflatten each patch to (L, gh, gw, p, p, C).
+    x = patches.reshape(-1, gh, gw, p, p, c)
+
+    # Reorder to (L, C, gh, p, gw, p).
+    x = x.permute(0, 5, 1, 3, 2, 4)
+
+    # Merge to (*lead, C, H, W).
+    x = x.reshape(*lead, c, h, w)
+
+    return x
 
 # --------------------------------------------------------------------------- #
 # Model
@@ -217,18 +225,26 @@ class MiniLVSM(nn.Module):
         b, s, n, d = source_tokens.shape
         t = target_tokens.shape[1]
         grid = int(math.isqrt(n))
-        # TODO (Q2.0): Build the (N, D) positional embedding for the grid x grid
+
+        # Build the (N, D) positional embedding for the grid x grid
         # patch layout with sincos_2d_pos_embed, matching the tokens' device/dtype.
-        pos = None
-        # TODO (Q2.0): Add it to the source and target tokens.
-        source = None  # (B, S, N, D)
-        target = None  # (B, T, N, D)
-        # TODO (Q2.0): Flatten each sample's sources into S*N tokens and repeat
+        pos = sincos_2d_pos_embed(d, grid, grid, device=source_tokens.device, dtype=source_tokens.dtype)
+
+        # Add it to the source and target tokens.
+        source = source_tokens + pos[None, None, :, :]  # (B, S, N, D)
+        target = target_tokens + pos[None, None, :, :]  # (B, T, N, D)
+
+        # Flatten each sample's sources into S*N tokens and repeat
         # them for every target: (B, T, S*N, D).
-        source = None
-        # TODO (Q2.0): Append each target's N query tokens after its sources,
+        source = source.reshape(b, s*n, d)
+        source = source.unsqueeze(1).expand(-1, t, -1, -1)
+
+        # Append each target's N query tokens after its sources,
         # then fold T into the batch: (B*T, (S+1)*N, D).
-        raise NotImplementedError("Q2.0: MiniLVSM.build_tokens")
+        tokens = torch.cat([source, target], dim=2)
+        tokens = tokens.reshape(b * t, (s + 1) * n, d)
+
+        return tokens
 
     # ---- Q2.0 ------------------------------------------------------------ #
     def forward(self, inputs):
@@ -244,25 +260,40 @@ class MiniLVSM(nn.Module):
             Dict with rgb: (B, T, 3, H, W), target RGB in [0, 1], in target view order.
         """
         source_rgb = inputs["source_rgb"]
+        source_plucker = inputs["source_plucker"]
         target_plucker = inputs["target_plucker"]
+
         b, t = target_plucker.shape[:2]
         h, w = source_rgb.shape[-2:]
         p = self.patch_size
         n = (h // p) * (w // p)
 
-        # TODO (Q2.0): Concatenate source RGB shifted to [-1, 1] with the source
+        # Concatenate source RGB shifted to [-1, 1] with the source
         # Plucker rays along channels: (B, S, 9, H, W).
-        source = None
-        # TODO (Q2.0): Patchify and project the sources with self.source_proj
+        source = torch.cat([source_rgb * 2 - 1, source_plucker], dim=2)
+
+        # Patchify and project the sources with self.source_proj
         # and the target rays with self.target_proj (the target never sees RGB).
-        source_tokens = None  # (B, S, N, D)
-        target_tokens = None  # (B, T, N, D)
-        # TODO (Q2.0): Build the tokens, apply self.input_norm, then every block.
-        tokens = None  # (B*T, (S+1)*N, D)
-        # TODO (Q2.0): Keep only each sequence's last N (target-query) tokens and
+        source_tokens = self.source_proj(patchify(source, p))  # (B, S, N, D)
+        target_tokens = self.target_proj(patchify(target_plucker, p))  # (B, T, N, D)
+
+        # Build the tokens, apply self.input_norm, then every block.
+        tokens = self.build_tokens(source_tokens, target_tokens)  # (B*T, (S+1)*N, D)
+        output = self.input_norm(tokens)
+
+        for block in self.blocks:
+            output = block(output)
+
+        # Keep only each sequence's last N (target-query) tokens and
         # decode them with self.out_norm, self.rgb_head and a sigmoid.
-        patches = None  # (B*T, N, p*p*3)
-        # TODO (Q2.0): Unpatchify and restore (B, T, 3, H, W).
-        rgb = None
-        raise NotImplementedError("Q2.0: MiniLVSM.forward")
+        output = output[:, -n:, :]
+
+        output = self.out_norm(output)   # (B*T, N, p*p*3)
+        output = self.rgb_head(output)
+        output = torch.sigmoid(output)
+
+        # Unpatchify and restore (B, T, 3, H, W).
+        output = output.reshape(b, t, n, p * p * 3)
+        rgb = unpatchify(output, p, (h, w))
+
         return {"rgb": rgb}
